@@ -26,19 +26,19 @@ Placeholder cells stay ordinary grid content. A virtual placement only records t
 3. **Decode placeholder cells** (new `crates/warp_terminal/src/model/kitty_unicode_placeholder.rs`).
    - Kitty's 297 row/column diacritics, sorted by code point and looked up by binary search.
    - `decode(cell, left)` reads the id from the foreground color and up to three marks, and inherits omitted ones from the decoded cell to its left by the protocol's rules (products 6, 7). A cell whose id is 0, or whose foreground is a named color, decodes to nothing (product 11).
-   - `PlaceholderRunBuilder` takes the visible cells in row-major order and groups horizontally adjacent cells that show consecutive columns of one image row into `PlaceholderRun`s (screen position, length, image id, first tile). `PlaceholderRunBuilder::new(enabled)` takes the `KittyImages` flag: disabled, it leaves every cell alone (product 19).
-   - `push` is `#[inline]` and tests the character before anything else, so a cell that isn't a placeholder costs the renderer's loop one comparison. For a placeholder it returns a blank cell with the original background, which the renderer draws instead. Both text paths, with and without ligatures, therefore draw no glyph or decoration for it (products 11, 12, 13) without changes of their own.
+   - `PlaceholderRunBuilder` takes the visible cells in row-major order and groups horizontally adjacent cells that show consecutive columns of one image row into `PlaceholderRun`s (screen position, size, image id, first tile). `finish` merges a run with the one below it when that continues its tiles, so an image shown whole is one run. `PlaceholderRunBuilder::new(enabled)` takes the `KittyImages` flag: disabled, it leaves every cell alone (product 19).
+   - `push` is `#[inline]` and tests the character before anything else, so a cell that isn't a placeholder costs the renderer's loop one comparison. For a placeholder it returns an empty cell with the original background, which the renderer draws instead, so neither text path draws a glyph or decoration for it (products 11, 12, 13). The path with ligatures lays out each row as one line of text; there a stretch of placeholder cells adds a single space, which keeps the text on either side from joining into a ligature.
 4. **Draw the runs** (`app/src/terminal/grid_renderer.rs`). Each renderer creates the builder with `FeatureFlag::KittyImages.is_enabled()`, passes every visible cell through `push`, and calls `render_placeholder_runs` after the merged backgrounds. For each run, it:
    - looks up the virtual placement, and skips the run if there is none or the image isn't loaded (product 11);
    - takes the image from the asset cache at its own size (`CacheOption::Original`);
    - fits it into the box of `cols × rows` cells, keeping its aspect ratio, and centers it (product 8);
-   - draws it in a layer clipped to the run's cells (`ClipBounds::BoundedByActiveLayerAnd`), positioned so the run's first cell shows its own tile (products 8, 9). The cell backgrounds drawn before it show where the image doesn't cover (product 10).
+   - draws it in a layer clipped to the run's cells (`ClipBounds::BoundedByActiveLayerAnd`), positioned so the run's top left cell shows its own tile (products 8, 9). The cell backgrounds drawn before it show where the image doesn't cover (product 10).
 
 ### Tradeoffs
 
 - **GPU scaling instead of `CacheOption::BySize`.** Placeholder images are often animations: the program sends each frame under the same id (product 14), and each frame is a new image to the cache. Resizing on the CPU, as `render_image` does, would resize every frame, and again on every window or font size change (product 17). Drawing at the image's own size lets the GPU scale it.
 - **Decoding at render time instead of at write time.** Decoding while parsing output would mean storing a placement per cell and re-decoding on every edit, scroll and reflow. Decoding the visible rows each frame costs one comparison per cell when there are no placeholders, and needs no new state.
-- **A blank replacement cell instead of special cases in the glyph code.** One hook per renderer covers both text paths and every decoration.
+- **An empty replacement cell instead of special cases in the glyph code.** One hook per renderer covers both text paths and every decoration; the path with ligatures needs one more line to leave the cells out of its text.
 
 ### End-to-end flow
 
@@ -66,7 +66,7 @@ Automated, run with `cargo test -p warp_terminal --features local_fs`:
 | 5, 15 | `blockgrid_tests::test_virtual_kitty_placement_of_stored_image_is_deleted_by_its_placement_id` (`a=p,U=1`): the newest placement wins, deleting by placement id; the first test also deletes by image id |
 | 6 | `kitty_unicode_placeholder_tests::test_decode_reads_id_and_tile`, `test_diacritics_are_sorted` |
 | 7 | `test_decode_infers_omitted_diacritics_from_left_cell`, `test_decode_inherits_id_byte_only_from_the_previous_tile` |
-| 8, 9 | `test_run_builder_merges_consecutive_tiles`, `test_run_builder_splits_runs_at_gaps_and_repeated_tiles` |
+| 8, 9 | `test_run_builder_merges_consecutive_tiles`, `test_run_builder_splits_runs_at_gaps_and_repeated_tiles`, `test_run_builder_merges_rows_that_continue_the_tiles_above` |
 | 11 | `test_decode_rejects_cells_without_an_image` |
 | 19 | `test_run_builder_ignores_placeholders_when_disabled`; the parser's existing `KittyImages` check drops the commands |
 
@@ -76,7 +76,8 @@ Manual, with `./script/run` on macOS, debug and `--release` builds. A demo scrip
 - The same picture sent as base64, a file, a temporary file and shared memory, each shown in placeholder cells.
 - A 60 fps animation, a GIF and a video, each re-sent frame by frame under one id (product 14).
 - Font ligatures on and off (product 13).
-- Claude Code drawing `<Image>`s above its prompt, its real use. During a 60 fps animation, a release build used about 29% of a core, mostly repainting the grid.
+- Claude Code drawing `<Image>`s above its prompt, its real use.
+- A benchmark in a release build on a MacBook Air (M4), sampling where the UI thread spends its time. Updating one line of text 60 times a second kept it busy 17–19% of the time: Warp's own cost of repainting. A still 64 × 18 cell image on screen added 3–5 points, and a 320 × 180 or 1280 × 720 image animating at 60 fps added 4–9. Before the changes that merge runs, keep placeholder cells out of the text line and copy received frames less, they added 10 and 13–30. Sent as fast as Warp read them, it took about 12,000 small and 990 large frames a second, the sender's own limit, with its memory flat.
 
 Still to check by hand: scrolling and scrollback, resizing the window and changing the font size (products 16, 17), and placeholder cells in another block (product 18). Products 4, 10, 12, 20 and 21 follow from code shared with direct placements, or from leaving cells unchanged, and have no tests of their own. Linux and Windows are untested.
 
@@ -86,7 +87,7 @@ Not proposed: the change is small, its parts depend on each other in order (acce
 
 ## Risks and mitigations
 
-- **Render cost with many images.** Every run is one clipped layer and one image draw, so a screen full of separate images costs one draw per row of each. Runs merge whole rows of one image, and non-placeholder cells cost one comparison.
+- **Render cost with many images.** Every run is one clipped layer and one image draw: one per image shown whole, more for an image shown in pieces. Cells that aren't placeholders cost one comparison.
 - **Placeholder cells without an image now draw blank instead of a missing-glyph box** while kitty images are on. That is what the protocol intends, and the box carried no information.
 - **One virtual placement per image.** A program that gives one image several virtual placements of different sizes sees all its cells use the newest. That needs underline colors in cells to fix (see Follow-ups).
 
