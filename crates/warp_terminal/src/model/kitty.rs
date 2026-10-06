@@ -818,6 +818,7 @@ fn read_shared_memory(
     });
 
     let data = read_from_shared_memory_fd(fd, size);
+    let _ = nix::unistd::close(fd);
 
     if let Err(err) = shm_unlink(path) {
         log::warn!("Failed to unlink kitty shm file (path = {path}): {err:?}");
@@ -833,7 +834,7 @@ fn read_from_shared_memory_fd(
 ) -> Result<Vec<u8>, InvalidKittyPayload> {
     use std::num::NonZero;
 
-    use nix::sys::mman::{MapFlags, ProtFlags, mmap};
+    use nix::sys::mman::{MapFlags, ProtFlags, mmap, munmap};
     use nix::sys::stat::fstat;
 
     let file_size = match fstat(fd) {
@@ -879,6 +880,7 @@ fn read_from_shared_memory_fd(
 
     let slice = unsafe { std::slice::from_raw_parts(ptr as *const u8, size.into()) };
     let data = slice.to_vec();
+    let _ = unsafe { munmap(ptr, size.into()) };
 
     Ok(data)
 }
@@ -966,3 +968,7 @@ pub fn create_kitty_ok_reply(image_id: u32) -> Vec<u8> {
 pub fn create_kitty_error_reply(image_id: u32, err: KittyError) -> Vec<u8> {
     create_kitty_reply(image_id, format!("{err:?}"))
 }
+
+#[cfg(all(test, feature = "local_fs"))]
+#[path = "kitty_tests.rs"]
+mod tests;
