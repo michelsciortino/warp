@@ -93,7 +93,7 @@ fn test_run_builder_merges_consecutive_tiles() {
     let mut builder = PlaceholderRunBuilder::new(true);
     assert!(builder.push(2, 0, &Cell::default()).is_none());
     let blank = builder.push(2, 1, &placeholder(Color::Indexed(9), &[1, 0]));
-    assert_eq!(blank.map(|cell| cell.c), Some(' '));
+    assert!(blank.is_some_and(|cell| cell.is_empty()));
     builder.push(2, 2, &placeholder(Color::Indexed(9), &[]));
     builder.push(3, 1, &placeholder(Color::Indexed(9), &[2, 0]));
     // A tile that does not follow on starts a new run.
@@ -103,6 +103,7 @@ fn test_run_builder_merges_consecutive_tiles() {
         screen_row,
         screen_col,
         len,
+        rows: 1,
         image_id: 9,
         tile_row,
         tile_col,
@@ -131,11 +132,49 @@ fn test_run_builder_splits_runs_at_gaps_and_repeated_tiles() {
         screen_row: 0,
         screen_col,
         len,
+        rows: 1,
         image_id: 9,
         tile_row: 0,
         tile_col: 0,
     };
     assert_eq!(builder.finish(), vec![run(0, 2), run(3, 1), run(4, 2)]);
+}
+
+#[test]
+fn test_run_builder_merges_rows_that_continue_the_tiles_above() {
+    /// Three cells showing tiles 0 to 2 of `tile_row`.
+    fn image_row(
+        builder: &mut PlaceholderRunBuilder,
+        screen_row: usize,
+        screen_col: usize,
+        tile_row: u32,
+    ) {
+        for col in 0..3 {
+            let cell = placeholder(Color::Indexed(9), &[tile_row, col]);
+            builder.push(screen_row, screen_col + col as usize, &cell);
+        }
+    }
+    let mut builder = PlaceholderRunBuilder::new(true);
+    image_row(&mut builder, 5, 2, 0);
+    image_row(&mut builder, 6, 2, 1);
+    image_row(&mut builder, 7, 2, 2);
+    // Shifted by a column, or after a screen row without the image: not continuations.
+    image_row(&mut builder, 8, 3, 3);
+    image_row(&mut builder, 10, 3, 4);
+
+    let run = |screen_row, screen_col, rows, tile_row| PlaceholderRun {
+        screen_row,
+        screen_col,
+        len: 3,
+        rows,
+        image_id: 9,
+        tile_row,
+        tile_col: 0,
+    };
+    assert_eq!(
+        builder.finish(),
+        vec![run(5, 2, 3, 0), run(8, 3, 1, 3), run(10, 3, 1, 4)]
+    );
 }
 
 #[test]

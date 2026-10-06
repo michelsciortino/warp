@@ -6,6 +6,8 @@
 //! diacritics give the tile's row, its column, and the id's most significant byte. A diacritic
 //! left out is inferred from the placeholder cell to the left.
 
+use std::collections::HashMap;
+
 use super::ansi::Color;
 use super::cell::Cell;
 use super::char_or_str::CharOrStr;
@@ -104,14 +106,16 @@ fn decode(cell: &Cell, left: Option<PlaceholderCell>) -> Option<PlaceholderCell>
     (image_id != 0).then_some(PlaceholderCell { image_id, row, col })
 }
 
-/// Placeholder cells on one screen row that show consecutive tiles of one image row.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+/// A rectangle of placeholder cells, `len` columns by `rows` screen rows, that show the
+/// corresponding rectangle of tiles of one image.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct PlaceholderRun {
     pub screen_row: usize,
     pub screen_col: usize,
     pub len: usize,
+    pub rows: usize,
     pub image_id: u32,
-    /// The tile the first cell shows.
+    /// The tile the top left cell shows.
     pub tile_row: u32,
     pub tile_col: u32,
 }
@@ -136,7 +140,7 @@ impl PlaceholderRunBuilder {
     }
 
     /// Records the cell at (`screen_row`, `screen_col`). For a placeholder, returns the cell to
-    /// draw in its place: its background only, since the image covers it.
+    /// draw in its place: an empty cell with its background, since the image covers it.
     ///
     /// Inlined into the renderer's loop over every cell, where a cell that is not a placeholder
     /// should cost one comparison rather than a call into this crate.
@@ -148,7 +152,6 @@ impl PlaceholderRunBuilder {
 
     fn push_placeholder(&mut self, screen_row: usize, screen_col: usize, cell: &Cell) -> Cell {
         let mut blank = Cell::default();
-        blank.c = ' ';
         blank.bg = cell.bg;
 
         let left = self.last.and_then(|(row, col, left)| {
@@ -170,6 +173,7 @@ impl PlaceholderRunBuilder {
                 screen_row,
                 screen_col,
                 len: 1,
+                rows: 1,
                 image_id: decoded.image_id,
                 tile_row: decoded.row,
                 tile_col: decoded.col,
@@ -178,8 +182,31 @@ impl PlaceholderRunBuilder {
         blank
     }
 
+    /// The runs found, a run merged with the one below it when that continues its tiles, so
+    /// that an image shown whole is one run.
     pub fn finish(self) -> Vec<PlaceholderRun> {
-        self.runs
+        let mut merged: Vec<PlaceholderRun> = Vec::with_capacity(self.runs.len());
+        // The index of each merged run, by the one-row run that would continue it.
+        let mut continued_by: HashMap<PlaceholderRun, usize> = HashMap::new();
+        for run in self.runs {
+            let index = match continued_by.remove(&run) {
+                Some(index) => {
+                    merged[index].rows += 1;
+                    index
+                }
+                None => {
+                    merged.push(run);
+                    merged.len() - 1
+                }
+            };
+            let below = PlaceholderRun {
+                screen_row: run.screen_row + 1,
+                tile_row: run.tile_row + 1,
+                ..run
+            };
+            continued_by.insert(below, index);
+        }
+        merged
     }
 }
 

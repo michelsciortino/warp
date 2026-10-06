@@ -1396,6 +1396,12 @@ fn render_grid_with_ligatures<'a>(
                 ctx,
             );
 
+            // A placeholder's image covers it, so it adds nothing to the text line but a space
+            // that keeps the text on either side from joining into a ligature, one per stretch.
+            if placeholder_blank.is_some() && string_builder.line.ends_with(' ') {
+                continue;
+            }
+
             let glyph_offset = cell_size * vec2f(col as f32, offset_row as f32);
             if first_cell_in_link {
                 // We want this to be a bounding box to be around the cell, so we don't include baseline_position in the origin.
@@ -1964,7 +1970,7 @@ fn render_placeholder_runs(
                 );
         let run_bounds = RectF::new(
             grid_origin + cell_size * vec2f(run.screen_col as f32, run.screen_row as f32),
-            cell_size * vec2f(run.len as f32, 1.),
+            cell_size * vec2f(run.len as f32, run.rows as f32),
         );
 
         ctx.scene
