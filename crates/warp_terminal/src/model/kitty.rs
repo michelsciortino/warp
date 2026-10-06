@@ -192,7 +192,9 @@ pub enum InvalidKittyPayload {
 
 #[derive(Debug, Clone)]
 pub enum FileError {
-    FileReadError(String),
+    /// Any file the terminal could not or would not read: one answer for all, so a program,
+    /// perhaps on another machine, cannot learn from it which files exist.
+    FileReadError,
     UnsupportedPlatform,
 }
 
@@ -730,6 +732,11 @@ pub fn parse_kitty_chunk(chunk: Vec<u8>) -> KittyChunk {
     }
 }
 
+/// The most bytes of one image read from a file or shared memory: more than any image a terminal
+/// shows (8K RGBA is 133 MB), and a bound on what a program can make the terminal read.
+#[cfg(feature = "local_fs")]
+const MAX_IMAGE_DATA_BYTES: usize = 256 * 1024 * 1024;
+
 #[cfg(feature = "local_fs")]
 fn read_file(decoded_payload: Vec<u8>, is_temp: bool) -> Result<Vec<u8>, InvalidKittyPayload> {
     let path = match str::from_utf8(&decoded_payload[..]) {
@@ -737,12 +744,11 @@ fn read_file(decoded_payload: Vec<u8>, is_temp: bool) -> Result<Vec<u8>, Invalid
         Err(err) => return Err(KittyDecodeError::InvalidUtf8(err.to_string()).into()),
     };
 
-    let data = match fs::read(path) {
+    let data = match read_regular_file(path) {
         Ok(data) => data,
         Err(err) => {
-            return Err(InvalidKittyPayload::FileError(FileError::FileReadError(
-                err.to_string(),
-            )));
+            log::warn!("Failed to read kitty image file (path = {path}): {err:#}");
+            return Err(InvalidKittyPayload::FileError(FileError::FileReadError));
         }
     };
 
@@ -750,6 +756,44 @@ fn read_file(decoded_payload: Vec<u8>, is_temp: bool) -> Result<Vec<u8>, Invalid
         safe_delete_temp_file(path);
     }
 
+    Ok(data)
+}
+
+/// Reads `path`, following symlinks, if it is a regular file of at most [`MAX_IMAGE_DATA_BYTES`]
+/// outside `/proc`, `/sys` and `/dev`, as the kitty protocol asks. Any program can name any path,
+/// and a device or FIFO could hold up the terminal reading it, never ending or never answering.
+#[cfg(feature = "local_fs")]
+fn read_regular_file(path: &str) -> std::io::Result<Vec<u8>> {
+    use std::io::Error;
+
+    let path = fs::canonicalize(path)?;
+    if ["/proc", "/sys", "/dev"]
+        .iter()
+        .any(|dir| path.starts_with(dir) && !path.starts_with("/dev/shm"))
+    {
+        return Err(Error::other("in /proc, /sys or /dev"));
+    }
+
+    let mut options = fs::OpenOptions::new();
+    options.read(true);
+    // Opening a FIFO waits for a writer: this way it opens at once, to be refused below.
+    #[cfg(unix)]
+    std::os::unix::fs::OpenOptionsExt::custom_flags(&mut options, libc::O_NONBLOCK);
+    let file = options.open(&path)?;
+    let metadata = file.metadata()?;
+    if !metadata.is_file() {
+        return Err(Error::other("not a regular file"));
+    }
+    if metadata.len() > MAX_IMAGE_DATA_BYTES as u64 {
+        return Err(Error::other(format!(
+            "{} bytes, over {MAX_IMAGE_DATA_BYTES}",
+            metadata.len()
+        )));
+    }
+
+    let mut data = Vec::with_capacity(metadata.len() as usize);
+    file.take(MAX_IMAGE_DATA_BYTES as u64)
+        .read_to_end(&mut data)?;
     Ok(data)
 }
 
@@ -807,14 +851,17 @@ fn read_shared_memory(
         }
     };
 
-    let bytes_per_pixel = match control_data.pixel_data_format {
+    let bytes_per_pixel: Option<usize> = match control_data.pixel_data_format {
         KittyPixelDataFormat::Rgb24Bit => Some(3),
         KittyPixelDataFormat::Rgba32Bit => Some(4),
         KittyPixelDataFormat::Png => None,
     };
 
+    // Saturating: any width and height a program sends, however large, is refused for its size.
     let size = bytes_per_pixel.map(|bytes_per_pixel| {
-        (bytes_per_pixel * control_data.width * control_data.height) as usize
+        bytes_per_pixel
+            .saturating_mul(control_data.width as usize)
+            .saturating_mul(control_data.height as usize)
     });
 
     let data = read_from_shared_memory_fd(fd, size);
@@ -851,6 +898,9 @@ fn read_from_shared_memory_fd(
     };
 
     let size = size.unwrap_or(file_size);
+    if size > MAX_IMAGE_DATA_BYTES {
+        return Err(InvalidKittyPayload::ShmError(ShmError::InvalidObjectSize));
+    }
 
     if file_size < size {
         return Err(InvalidKittyPayload::ShmError(ShmError::ObjectTooSmall {
